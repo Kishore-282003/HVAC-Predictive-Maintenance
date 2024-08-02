@@ -1,0 +1,229 @@
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <WiFiClientSecure.h>
+#include <DHT.h>
+#include "EmonLib.h" // Include Emon Library
+
+// DHT Sensor Setup
+#define DHTPIN 4 // Change to the pin connected to DHT sensor
+#define DHTTYPE DHT11 
+DHT dht(DHTPIN, DHTTYPE);
+
+// WiFi Setup
+const char* ssid = "Enter your SSID";  // Update with your SSID
+const char* password = "Enter your Password";  // Update with your WiFi password
+const char* host = "script.google.com";
+const int httpsPort = 443;
+WiFiClientSecure client;
+
+// Google Apps Script ID
+String GOOGLE_SCRIPT_ID = "AKfycbwgHB_xWYtLVynnLWMaqo7k0yYMBuc3GrSei4CLasglf7-X0Cl3XWwHdWNcer4Upm6z";
+
+// Power Measurement Setup
+EnergyMonitor emon1; // Create an instance for voltage measurement
+EnergyMonitor SCT013; // Create an instance for current measurement
+#define VOLT_CAL 670 // Voltage calibration factor
+#define CURRENT_CAL 5 // Current calibration factor
+int pinSCT = 36; // Analog pin connected to the SCT-013
+int voltage = 127; // Voltage supply value
+int power; // Power variable
+double energyConsumption = 0; // Energy consumption variable in Wh
+unsigned long lastMeasurementTime = 0;
+
+// Relay Setup
+#define relay1_pin 15
+const int sendInterval = 500;
+
+void setup() {
+  dht.begin();  // Start DHT sensor
+  Serial.begin(115200);
+  
+  // Setup WiFi
+  Serial.print("Connecting to ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  // Initialize voltage and current measurement instances
+  emon1.voltage(34, VOLT_CAL, 1.7); // Voltage: input pin, calibration, phase_shift
+  SCT013.current(pinSCT, CURRENT_CAL); // Initialize SCT-013 with calibration factor
+
+  // Relay initialization
+  pinMode(relay1_pin, OUTPUT);
+  digitalWrite(relay1_pin, LOW); // Initially turn off the relay
+
+  lastMeasurementTime = millis();
+}
+
+void loop() {
+  // Measure and log temperature, humidity, voltage, current, power, and energy consumption
+  measureAndLogData();
+
+  // Read and control relay based on Google Sheet data
+  readGoogleSheet();
+
+  delay(sendInterval); // Delay between measurements
+}
+
+void measureAndLogData() {
+  // Measure temperature and humidity
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  Serial.print("Temperature: ");
+  Serial.print(t);
+  Serial.print("°C, Humidity: ");
+  Serial.print(h);
+  Serial.println("%");
+
+  // Measure voltage and current
+  emon1.calcVI(25, 1000); // Calculate voltage. No. of half wavelengths (crossings), time-out
+  float supplyVoltage = emon1.Vrms; // Extract Vrms into Variable
+  double Irms = SCT013.calcIrms(1480); // Calculate the current value
+  power = Irms * voltage; // Calculate instantaneous power value    
+
+  // Calculate energy consumption
+  unsigned long currentTime = millis();
+  double timeElapsedHours = (currentTime - lastMeasurementTime) / 3600000.0; // Convert time elapsed to hours
+  energyConsumption += power * timeElapsedHours; // Accumulate energy consumption in Wh
+  lastMeasurementTime = currentTime;
+
+  Serial.print("Power: ");
+  Serial.print(power);
+  Serial.print("W, Energy Consumption: ");
+  Serial.print(energyConsumption);
+  Serial.println("Wh");
+
+  // Send all data to Google Apps Script
+  sendDataToGoogleSheet(t, h, supplyVoltage, Irms, power, energyConsumption);
+}
+
+void sendDataToGoogleSheet(float temperature, float humidity, float voltage, double current, int power, double energy) {
+  client.setInsecure();
+  Serial.print("Connecting to ");
+  Serial.println(host);
+  
+  if (!client.connect(host, httpsPort)) {
+    Serial.println("Connection failed");
+    return;
+  }
+
+  // Construct the URL with all parameters
+  String url = "/macros/s/" + GOOGLE_SCRIPT_ID + "/exec?temperature=" + String(temperature) +
+               "&humidity=" + String(humidity) +
+               "&voltage=" + String(voltage) +
+               "&current=" + String(current) +
+               "&power=" + String(power) +
+               "&energy=" + String(energy);
+
+  Serial.print("Requesting URL: ");
+  Serial.println(url);
+
+  client.print(String("GET ") + url + " HTTP/1.1\r\n" +
+               "Host: " + host + "\r\n" +
+               "User-Agent: ESP32\r\n" +
+               "Connection: close\r\n\r\n");
+
+  while (client.connected()) {
+    String line = client.readStringUntil('\n');
+    if (line == "\r") {
+      Serial.println("Headers received");
+      break;
+    }
+  }
+  String line = client.readStringUntil('\n');
+  Serial.println("Reply was:");
+  Serial.println(line);
+  client.stop();
+}
+
+void readGoogleSheet() {
+  HTTPClient http;
+  String url = "https://script.google.com/macros/s/" + GOOGLE_SCRIPT_ID + "/exec?read";
+  
+  Serial.println("Reading Data From Google Sheet.....");
+  http.begin(url.c_str());
+
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+
+  int httpCode = http.GET();
+  Serial.print("HTTP Status Code: ");
+  Serial.println(httpCode);
+
+  if (httpCode <= 0) {
+    Serial.println("Error on HTTP request"); 
+    http.end(); 
+    return;
+  }
+
+  String payload = http.getString();
+  Serial.println("Payload: " + payload);
+  
+  if (httpCode == 200) {
+    String temp = payload.substring(0, 1);
+    int relay_number = temp.toInt();
+
+    payload.remove(0, 1);
+    payload.toLowerCase();
+    payload.trim();
+    Serial.println("Payload - Command: " + payload);
+    
+    if (payload != "on" && payload != "off") {
+      Serial.println("Invalid Command"); 
+      http.end(); 
+      return;
+    }
+
+    if (relay_number != 1) {
+      Serial.println("Invalid Relay Number"); 
+      http.end(); 
+      return;
+    }
+
+    int relay_state = controlRelay(relay_number, payload);
+    writeGoogleSheet("relay_number=" + String(relay_number) + "&relay_state=" + String(relay_state));
+  }
+
+  http.end();
+}
+
+void writeGoogleSheet(String params) {
+  HTTPClient http;
+  String url = "https://script.google.com/macros/s/" + GOOGLE_SCRIPT_ID + "/exec?" + params;
+  
+  Serial.println("Updating Status of Relay");
+  http.begin(url.c_str());
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  int httpCode = http.GET();  
+  Serial.print("HTTP Status Code: ");
+  Serial.println(httpCode);
+  
+  String payload;
+  if (httpCode > 0) {
+      payload = http.getString();
+      Serial.println("Payload: " + payload);     
+  }
+  http.end();
+}
+
+int controlRelay(int relay, String command) {
+  if (relay == 1) {
+    if (command == "on") {
+      digitalWrite(relay1_pin, HIGH);
+      Serial.println("Relay 1 is ON");
+      return 1;
+    } else {
+      digitalWrite(relay1_pin, LOW);
+      Serial.println("Relay 1 is OFF");
+      return 0;
+    }
+  } else {
+    return -1;
+  }
+}
